@@ -1,0 +1,72 @@
+#include <HardwareSerial.h>  // ESP32的HardwareSerial库
+
+HardwareSerial Sensor1(1);  // 使用UART1
+HardwareSerial Sensor2(2);  // 使用UART2
+
+const uint8_t COM = 0x55;  // 查询命令
+unsigned char buffer1[4] = {0};  // 传感器1缓冲区
+unsigned char buffer2[4] = {0};  // 传感器2缓冲区
+int distance1 = 0;  // 传感器1距离
+int distance2 = 0;  // 传感器2距离
+
+void setup() {
+  Serial.begin(115200);  // 串口监视器，用于输出调试信息
+  
+  // 初始化传感器1 UART：波特率115200，8N1，RX引脚GPIO16，TX引脚GPIO17
+  Sensor1.begin(115200, SERIAL_8N1, 16, 17);
+  
+  // 初始化传感器2 UART：波特率115200，8N1，RX引脚GPIO18，TX引脚GPIO19
+  Sensor2.begin(115200, SERIAL_8N1, 18, 19);
+  
+  Serial.println("ESP32 初始化完成，开始检测距离...");
+}
+
+void loop() {
+  // 查询传感器1
+  Sensor1.write(COM);
+  delay(100);  // 等待响应
+  if (Sensor1.available() >= 4) {
+    if (Sensor1.read() == 0xFF) {
+      buffer1[0] = 0xFF;
+      for (int i = 1; i < 4; i++) {
+        buffer1[i] = Sensor1.read();
+      }
+      uint8_t cs = buffer1[0] + buffer1[1] + buffer1[2];
+      if (buffer1[3] == cs) {
+        distance1 = (buffer1[1] << 8) + buffer1[2];
+        Serial.print("传感器1 距离: ");
+        Serial.print(distance1);
+        Serial.println(" mm");
+      } else {
+        Serial.println("传感器1 校验和错误");
+      }
+    }
+  } else {
+    Serial.println("传感器1 无响应");
+  }
+  
+  // 查询传感器2
+  Sensor2.write(COM);
+  delay(100);  // 等待响应
+  if (Sensor2.available() >= 4) {
+    if (Sensor2.read() == 0xFF) {
+      buffer2[0] = 0xFF;
+      for (int i = 1; i < 4; i++) {
+        buffer2[i] = Sensor2.read();
+      }
+      uint8_t cs = buffer2[0] + buffer2[1] + buffer2[2];
+      if (buffer2[3] == cs) {
+        distance2 = (buffer2[1] << 8) + buffer2[2];
+        Serial.print("传感器2 距离: ");
+        Serial.print(distance2);
+        Serial.println(" mm");
+      } else {
+        Serial.println("传感器2 校验和错误");
+      }
+    }
+  } else {
+    Serial.println("传感器2 无响应");
+  }
+  
+  delay(500);  // 每0.5秒查询一次，避免过于频繁
+}
