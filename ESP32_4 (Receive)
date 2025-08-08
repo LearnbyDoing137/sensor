@@ -1,0 +1,313 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <ArduinoJson.h>
+
+// 感測器通信參數
+#define COM 0x55
+#define BAUD_RATE 115200
+#define TIMEOUT_MS 500
+#define MAX_DISTANCE_CM 600.0
+
+// 感測器引腳（僅side_right）
+#define RXD_SIDE_RIGHT 16 // UART2 RX
+#define TXD_SIDE_RIGHT 17 // UART2 TX
+HardwareSerial SerialSensorSideRight(2);
+
+// Wi-Fi設置（Access Point模式）
+const char* ssid = "ESP32_Webserver";
+const char* password = "12345678";
+IPAddress local_IP(192, 168, 40, 1);
+IPAddress gateway(192, 168, 40, 1);
+IPAddress subnet(255, 255, 255, 0);
+
+// WebServer設置
+WebServer server(80);
+
+// 感測器數據
+float currentDistanceLeft = -1.0;
+float currentDistanceRight = -1.0;
+float currentDistanceUnder = -1.0;
+float currentDistanceFront = -1.0;
+float currentDistanceBack = -1.0;
+float currentDistanceSideLeft = -1.0;
+float currentDistanceSideRight = -1.0;
+
+// 緩衝區
+unsigned char buffer_SideRight[4] = {0};
+
+// 讀取計時
+unsigned long lastSensorReadTime = 0;
+
+// 函數宣告
+bool readSensorData(HardwareSerial &sensor, unsigned char *buffer);
+bool validateChecksum(unsigned char *buffer);
+float extractDistance(unsigned char *buffer);
+void clearSerialBuffer(HardwareSerial &sensor);
+void debugRawData(HardwareSerial &sensor, const char *sensorName);
+
+// HTML網頁內容（顯示7個感測器）
+const char* index_html = R"rawliteral(
+<!DOCTYPE HTML>
+<html>
+<head>
+  <title>Underwater Distance Sensors</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    body {
+      font-family: 'Roboto', sans-serif;
+      background: linear-gradient(135deg, #1e1e2f, #2e2e4f);
+      color: #ffffff;
+      text-align: center;
+      margin: 0;
+      padding: 20px;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+    }
+    h2 {
+      font-size: 2.5em;
+      margin-bottom: 20px;
+      text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.5);
+    }
+    .sensor-container {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: center;
+      gap: 20px;
+    }
+    .sensor {
+      background: rgba(255, 255, 255, 0.1);
+      border-radius: 15px;
+      padding: 20px;
+      width: 200px;
+      box-shadow: 0 4px 15px rgba(0, 0, 0, 0.3);
+      transition: transform 0.3s ease, box-shadow 0.3s ease;
+    }
+    .sensor:hover {
+      transform: translateY(-5px);
+      box-shadow: 0 6px 20px rgba(0, 0, 0, 0.5);
+    }
+    .sensor h3 {
+      font-size: 1.2em;
+      margin-bottom: 10px;
+      color: #a1c4fd;
+    }
+    .distance {
+      font-size: 1.8em;
+      color: #c3e88d;
+      opacity: 0;
+      animation: fadeIn 0.5s forwards;
+    }
+    @keyframes fadeIn {
+      from { opacity: 0; transform: translateY(10px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+  </style>
+</head>
+<body>
+  <h2>Underwater Distance Sensors</h2>
+  <div class="sensor-container">
+    <div class="sensor">
+      <h3>Left Sensor</h3>
+      <p class="distance" id="left">N/A</p>
+    </div>
+    <div class="sensor">
+      <h3>Right Sensor</h3>
+      <p class="distance" id="right">N/A</p>
+    </div>
+    <div class="sensor">
+      <h3>Under Sensor</h3>
+      <p class="distance" id="under">N/A</p>
+    </div>
+    <div class="sensor">
+      <h3>Front Sensor</h3>
+      <p class="distance" id="front">N/A</p>
+    </div>
+    <div class="sensor">
+      <h3>Back Sensor</h3>
+      <p class="distance" id="back">N/A</p>
+    </div>
+    <div class="sensor">
+      <h3>Side Left Sensor</h3>
+      <p class="distance" id="side_left">N/A</p>
+    </div>
+    <div class="sensor">
+      <h3>Side Right Sensor</h3>
+      <p class="distance" id="side_right">N/A</p>
+    </div>
+  </div>
+  <script>
+    function updateSensorData() {
+      fetch('/data')
+        .then(response => response.json())
+        .then(data => {
+          document.getElementById('left').innerText = data.left !== -1 ? data.left.toFixed(1) + ' cm' : 'N/A';
+          document.getElementById('right').innerText = data.right !== -1 ? data.right.toFixed(1) + ' cm' : 'N/A';
+          document.getElementById('under').innerText = data.under !== -1 ? data.under.toFixed(1) + ' cm' : 'N/A';
+          document.getElementById('front').innerText = data.front !== -1 ? data.front.toFixed(1) + ' cm' : 'N/A';
+          document.getElementById('back').innerText = data.back !== -1 ? data.back.toFixed(1) + ' cm' : 'N/A';
+          document.getElementById('side_left').innerText = data.side_left !== -1 ? data.side_left.toFixed(1) + ' cm' : 'N/A';
+          document.getElementById('side_right').innerText = data.side_right !== -1 ? data.side_right.toFixed(1) + ' cm' : 'N/A';
+        })
+        .catch(error => console.error('Error:', error));
+    }
+    setInterval(updateSensorData, 1000); // 每1秒更新數據
+    updateSensorData(); // 初次加載時更新
+  </script>
+</body>
+</html>
+)rawliteral";
+
+void handleRoot() {
+  server.send(200, "text/html", index_html);
+}
+
+void handleData() {
+  StaticJsonDocument<300> doc;
+  doc["left"] = currentDistanceLeft;
+  doc["right"] = currentDistanceRight;
+  doc["under"] = currentDistanceUnder;
+  doc["front"] = currentDistanceFront;
+  doc["back"] = currentDistanceBack;
+  doc["side_left"] = currentDistanceSideLeft;
+  doc["side_right"] = currentDistanceSideRight;
+  String json;
+  serializeJson(doc, json);
+  server.send(200, "application/json", json);
+}
+
+void handleUpdate() {
+  if (server.hasArg("plain")) {
+    String body = server.arg("plain");
+    StaticJsonDocument<300> doc;
+    DeserializationError error = deserializeJson(doc, body);
+    if (!error) {
+      if (doc.containsKey("left")) currentDistanceLeft = doc["left"].as<float>();
+      if (doc.containsKey("right")) currentDistanceRight = doc["right"].as<float>();
+      if (doc.containsKey("under")) currentDistanceUnder = doc["under"].as<float>();
+      if (doc.containsKey("front")) currentDistanceFront = doc["front"].as<float>();
+      if (doc.containsKey("back")) currentDistanceBack = doc["back"].as<float>();
+      if (doc.containsKey("side_left")) currentDistanceSideLeft = doc["side_left"].as<float>();
+      server.send(200, "text/plain", "Data updated");
+    } else {
+      server.send(400, "text/plain", "Invalid JSON");
+    }
+  } else {
+    server.send(400, "text/plain", "No data received");
+  }
+}
+
+void setup() {
+  Serial.begin(BAUD_RATE);
+  SerialSensorSideRight.begin(BAUD_RATE, SERIAL_8N1, RXD_SIDE_RIGHT, TXD_SIDE_RIGHT);
+
+  // 設置Wi-Fi為Access Point模式
+  Serial.println("Setting AP (Access Point)...");
+  WiFi.softAPConfig(local_IP, gateway, subnet);
+  WiFi.softAP(ssid, password, 1); // 設置通道為1，減少干擾
+  Serial.print("AP IP address: ");
+  Serial.println(WiFi.softAPIP());
+
+  // 設置WebServer路由
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/data", HTTP_GET, handleData);
+  server.on("/update", HTTP_POST, handleUpdate);
+
+  // 啟動WebServer
+  server.begin();
+  Serial.println("WebServer started");
+  delay(1000); // 確保感測器啟動完成
+}
+
+void loop() {
+  server.handleClient(); // 處理WebServer請求
+
+  if (millis() - lastSensorReadTime >= 1000) {
+    // 讀取side_right
+    SerialSensorSideRight.write(COM);
+    if (readSensorData(SerialSensorSideRight, buffer_SideRight)) {
+      if (validateChecksum(buffer_SideRight)) {
+        float newDistance = extractDistance(buffer_SideRight);
+        if (newDistance > 0.0 && newDistance <= MAX_DISTANCE_CM) {
+          currentDistanceSideRight = newDistance;
+        }
+      } else {
+        Serial.println("Side Right: Checksum error");
+        debugRawData(SerialSensorSideRight, "Side Right");
+      }
+    } else {
+      Serial.println("Side Right: No complete data received");
+      debugRawData(SerialSensorSideRight, "Side Right");
+      clearSerialBuffer(SerialSensorSideRight);
+    }
+
+    // 在串口監視器中顯示所有距離
+    Serial.print("Left: ");
+    if (currentDistanceLeft < 0.0) Serial.print("N/A"); else Serial.print(currentDistanceLeft, 1);
+    Serial.print(" cm, Right: ");
+    if (currentDistanceRight < 0.0) Serial.print("N/A"); else Serial.print(currentDistanceRight, 1);
+    Serial.print(" cm, Under: ");
+    if (currentDistanceUnder < 0.0) Serial.print("N/A"); else Serial.print(currentDistanceUnder, 1);
+    Serial.print(" cm, Front: ");
+    if (currentDistanceFront < 0.0) Serial.print("N/A"); else Serial.print(currentDistanceFront, 1);
+    Serial.print(" cm, Back: ");
+    if (currentDistanceBack < 0.0) Serial.print("N/A"); else Serial.print(currentDistanceBack, 1);
+    Serial.print(" cm, Side Left: ");
+    if (currentDistanceSideLeft < 0.0) Serial.print("N/A"); else Serial.print(currentDistanceSideLeft, 1);
+    Serial.print(" cm, Side Right: ");
+    if (currentDistanceSideRight < 0.0) Serial.print("N/A"); else Serial.print(currentDistanceSideRight, 1);
+    Serial.println(" cm");
+
+    lastSensorReadTime = millis();
+  }
+}
+
+bool readSensorData(HardwareSerial &sensor, unsigned char *buffer) {
+  unsigned long startTime = millis();
+  while (sensor.available() < 4 && millis() - startTime < TIMEOUT_MS) {
+    // 等待數據或超時
+  }
+  if (sensor.available() >= 4) {
+    if (sensor.read() == 0xFF) {
+      buffer[0] = 0xFF;
+      for (int i = 1; i < 4; i++) {
+        buffer[i] = sensor.read();
+      }
+      return true;
+    } else {
+      return false; // 第一個字節不是0xFF
+    }
+  }
+  return false; // 數據不足
+}
+
+bool validateChecksum(unsigned char *buffer) {
+  uint8_t cs = buffer[0] + buffer[1] + buffer[2];
+  return buffer[3] == cs;
+}
+
+float extractDistance(unsigned char *buffer) {
+  int distance_mm = (buffer[1] << 8) + buffer[2]; // 原始距離（毫米）
+  return distance_mm / 10.0; // 轉換為厘米（浮點數）
+}
+
+void clearSerialBuffer(HardwareSerial &sensor) {
+  while (sensor.available()) {
+    sensor.read();
+  }
+}
+
+void debugRawData(HardwareSerial &sensor, const char *sensorName) {
+  Serial.print(sensorName);
+  Serial.print(" Raw Data: ");
+  if (sensor.available()) {
+    while (sensor.available()) {
+      Serial.print(sensor.read(), HEX);
+      Serial.print(" ");
+    }
+  } else {
+    Serial.print("No data");
+  }
+  Serial.println();
+}
