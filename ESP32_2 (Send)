@@ -1,0 +1,185 @@
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+
+// 感測器通信參數（同ESP32_1）
+#define COM 0x55
+#define BAUD_RATE 115200
+#define TIMEOUT_MS 500
+#define MAX_DISTANCE_CM 600.0
+
+// 感測器引腳
+#define RXD_UNDER 16 // UART2 RX
+#define TXD_UNDER 17 // UART2 TX
+HardwareSerial SerialSensorUnder(2);
+
+#define RXD_FRONT 18 // UART1 RX
+#define TXD_FRONT 19 // UART1 TX
+HardwareSerial SerialSensorFront(1);
+
+// Wi-Fi設置（同ESP32_1）
+const char* ssid = "ESP32_Webserver";
+const char* password = "12345678";
+const char* serverUrl = "http://192.168.40.1/update";
+
+// 感測器數據
+float currentDistanceUnder = -1.0;
+float currentDistanceFront = -1.0;
+
+// 緩衝區
+unsigned char buffer_Under[4] = {0};
+unsigned char buffer_Front[4] = {0};
+
+// 讀取計時
+unsigned long lastSensorReadTime = 0;
+
+// 函數宣告（同ESP32_1）
+
+void setup() {
+  Serial.begin(BAUD_RATE);
+  SerialSensorUnder.begin(BAUD_RATE, SERIAL_8N1, RXD_UNDER, TXD_UNDER);
+  SerialSensorFront.begin(BAUD_RATE, SERIAL_8N1, RXD_FRONT, TXD_FRONT);
+
+  // 連接Wi-Fi（同ESP32_1）
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(1000);
+    Serial.println("Connecting to WiFi...");
+  }
+  Serial.println("Connected to WiFi");
+  delay(1000);
+}
+
+void loop() {
+  if (millis() - lastSensorReadTime >= 1000) {
+    // 讀取under
+    SerialSensorUnder.write(COM);
+    if (readSensorData(SerialSensorUnder, buffer_Under)) {
+      if (validateChecksum(buffer_Under)) {
+        float newDistance = extractDistance(buffer_Under);
+        if (newDistance > 0.0 && newDistance <= MAX_DISTANCE_CM) {
+          currentDistanceUnder = newDistance;
+        }
+      } else {
+        Serial.println("Under: Checksum error");
+        debugRawData(SerialSensorUnder, "Under");
+      }
+    } else {
+      Serial.println("Under: No complete data received");
+      debugRawData(SerialSensorUnder, "Under");
+      clearSerialBuffer(SerialSensorUnder);
+    }
+
+    // 讀取front
+    SerialSensorFront.write(COM);
+    if (readSensorData(SerialSensorFront, buffer_Front)) {
+      if (validateChecksum(buffer_Front)) {
+        float newDistance = extractDistance(buffer_Front);
+        if (newDistance > 0.0 && newDistance <= MAX_DISTANCE_CM) {
+          currentDistanceFront = newDistance;
+        }
+      } else {
+        Serial.println("Front: Checksum error");
+        debugRawData(SerialSensorFront, "Front");
+      }
+    } else {
+      Serial.println("Front: No complete data received");
+      debugRawData(SerialSensorFront, "Front");
+      clearSerialBuffer(SerialSensorFront);
+    }
+
+    // 顯示
+    Serial.print("Under: ");
+    if (currentDistanceUnder < 0.0) {
+      Serial.print("N/A");
+    } else {
+      Serial.print(currentDistanceUnder, 1);
+    }
+    Serial.print(" cm, Front: ");
+    if (currentDistanceFront < 0.0) {
+      Serial.print("N/A");
+    } else {
+      Serial.print(currentDistanceFront, 1);
+    }
+    Serial.println(" cm");
+
+    // 發送數據
+    sendDataToServer();
+
+    lastSensorReadTime = millis();
+  }
+}
+
+void sendDataToServer() {
+  if (WiFi.status() == WL_CONNECTED) {
+    HTTPClient http;
+    http.begin(serverUrl);
+    http.addHeader("Content-Type", "application/json");
+
+    StaticJsonDocument<200> doc;
+    doc["under"] = currentDistanceUnder;
+    doc["front"] = currentDistanceFront;
+    String json;
+    serializeJson(doc, json);
+
+    int httpCode = http.POST(json);
+    if (httpCode > 0) {
+      Serial.printf("HTTP POST code: %d\n", httpCode);
+    } else {
+      Serial.println("HTTP POST error");
+    }
+    http.end();
+  } else {
+    Serial.println("WiFi not connected");
+  }
+}
+
+// 其他函數（readSensorData, validateChecksum, extractDistance, clearSerialBuffer, debugRawData）同ESP32_1
+bool readSensorData(HardwareSerial &sensor, unsigned char *buffer) {
+  unsigned long startTime = millis();
+  while (sensor.available() < 4 && millis() - startTime < TIMEOUT_MS) {
+    // 等待數據或超時
+  }
+  if (sensor.available() >= 4) {
+    if (sensor.read() == 0xFF) {
+      buffer[0] = 0xFF;
+      for (int i = 1; i < 4; i++) {
+        buffer[i] = sensor.read();
+      }
+      return true;
+    } else {
+      return false; // 第一個字節不是0xFF
+    }
+  }
+  return false; // 數據不足
+}
+
+bool validateChecksum(unsigned char *buffer) {
+  uint8_t cs = buffer[0] + buffer[1] + buffer[2];
+  return buffer[3] == cs;
+}
+
+float extractDistance(unsigned char *buffer) {
+  int distance_mm = (buffer[1] << 8) + buffer[2]; // 原始距離（毫米）
+  return distance_mm / 10.0; // 轉換為厘米（浮點數）
+}
+
+void clearSerialBuffer(HardwareSerial &sensor) {
+  while (sensor.available()) {
+    sensor.read();
+  }
+}
+
+void debugRawData(HardwareSerial &sensor, const char *sensorName) {
+  Serial.print(sensorName);
+  Serial.print(" Raw Data: ");
+  if (sensor.available()) {
+    while (sensor.available()) {
+      Serial.print(sensor.read(), HEX);
+      Serial.print(" ");
+    }
+  } else {
+    Serial.print("No data");
+  }
+  Serial.println();
+}
